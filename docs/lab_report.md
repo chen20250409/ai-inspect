@@ -1,0 +1,957 @@
+# AI 视觉质检系统 · 实训操作文档
+
+> 记录本次实训的完整操作过程：每一步执行的命令、真实输出、遇到的报错以及排错过程。
+
+---
+
+## 〇、实训环境
+
+| 项目 | 内容 |
+|------|------|
+| 操作系统 | Ubuntu 26.04.1 LTS（内核 7.0.0-31-generic，x86_64） |
+| 虚拟机 IP | `192.168.88.130` |
+| SSH | `ssh chen@192.168.88.130 -p 2222` |
+| Docker | 29.7.2（需 sudo 执行） |
+| 项目根目录 | `/home/chen/ai-inspect` |
+| Python（容器内） | 3.11-slim |
+| 关键依赖 | fastapi 0.115.6 / uvicorn 0.34.0 / PyMySQL 1.1.1 / pillow 11.1.0 / numpy 2.2.1 |
+
+Docker 守护进程配置（`/etc/docker/daemon.json`）：
+
+```json
+{
+  "registry-mirrors": ["https://docker.1ms.run", "https://docker.xuanyuan.me"],
+  "data-root": "/mnt/disk2/docker"
+}
+```
+
+> 说明：本机 Docker 命令必须加 `sudo`（当前用户未加入 docker 组）。下文所有
+> `docker` 命令均以 `sudo` 执行。
+
+---
+
+## 阶段 1：初始化项目目录 + Git 版本管理
+
+### 步骤 1 创建项目目录结构
+
+```bash
+mkdir -p ~/ai-inspect/upload_img ~/ai-inspect/mysql-data ~/ai-inspect/backend
+cd ~/ai-inspect
+```
+
+实际输出：
+
+```
+$ ls -la ~/ai-inspect
+drwxrwxr-x  6 chen chen 4096 Oct 13 08:42 .
+drwxr-x--- 18 chen chen 4096 Oct 13 08:42 ..
+drwxrwxr-x  6 chen chen 4096 Oct 13 08:42 .git
+drwxrwxr-x  2 chen chen 4096 Oct 13 08:42 backend
+drwxrwxr-x  2 chen chen 4096 Oct 13 08:42 mysql-data
+drwxrwxr-x  2 chen chen 4096 Oct 13 08:42 upload_img
+```
+
+三个目录的分工：
+
+- `upload_img/` —— 存放相机上传的图片，挂载到 FastAPI 容器，**同时挂载给 Nginx**
+  用于静态直出，做到一份数据两处使用
+- `mysql-data/` —— MySQL 数据持久化目录，容器删掉数据也不丢
+- `backend/` —— FastAPI 源码
+
+### 步骤 2 初始化 Git 仓库
+
+```bash
+git init -b main
+git config user.name chen
+git config user.email chen@qq.com
+```
+
+### 步骤 3 安装 Docker
+
+本机已预装 Docker，确认版本：
+
+```bash
+docker --version
+# Docker version 29.7.2, build a7dcaa6
+```
+
+### 步骤 4 编写 .gitignore
+
+**注意**：`mysql-data/` 和 `upload_img/` 里的内容不能提交（一个是数据库二进制文件，
+一个是运行时产生的图片），必须排除：
+
+```gitignore
+mysql-data/
+upload_img/*
+!upload_img/.gitkeep
+__pycache__/
+*.py[cod]
+.venv/
+*.log
+```
+
+---
+
+## 阶段 2：启动 MySQL 容器
+
+### 步骤 1 创建自定义 Docker 网络
+
+```bash
+sudo docker network create ai-net
+# 3e9127e825d8d94025ca96bb5e2f09b70d222f0776495a37ccbed28a4e012b93
+```
+
+> **重点**：同一个自定义网络里，**容器名就是域名**。所以 FastAPI 连接数据库时
+> host 必须写 `mysql-ai`。写成 `localhost` 会指向 FastAPI 容器自己，必然连不上。
+
+### 步骤 2 启动 mysql8.0 容器
+
+```bash
+sudo docker run -d --name mysql-ai \
+  --network ai-net \
+  -e MYSQL_ROOT_PASSWORD=123456 \
+  -e TZ=Asia/Shanghai \
+  -p 3306:3306 \
+  -v /home/chen/ai-inspect/mysql-data:/var/lib/mysql \
+  mysql:8.0 \
+  --character-set-server=utf8mb4 \
+  --collation-server=utf8mb4_unicode_ci \
+  --default-time-zone=+08:00
+```
+
+参数说明：
+
+| 参数 | 作用 |
+|------|------|
+| `--network ai-net` | 加入自定义网络，供其他容器按名字访问 |
+| `-e MYSQL_ROOT_PASSWORD` | 初始化 root 密码（首次启动才生效） |
+| `-e TZ=Asia/Shanghai` | 容器时区设为北京时间 |
+| `-p 3306:3306` | 映射端口，方便用客户端工具连库调试 |
+| `-v ...:/var/lib/mysql` | 数据卷挂载，实现数据持久化 |
+| `--default-time-zone=+08:00` | MySQL 内部时区设为东八区 |
+
+### 步骤 3 等待 MySQL 就绪
+
+MySQL 首次启动要初始化数据目录，**不能启动完立刻连**，需要轮询等待：
+
+```bash
+for i in $(seq 1 60); do
+  if sudo docker exec mysql-ai mysqladmin ping -uroot -p123456 --silent 2>/dev/null \
+       | grep -q 'mysqld is alive'; then
+    echo "[第 ${i} 次探测] mysqld is alive —— 就绪"
+    break
+  fi
+  echo "[第 ${i} 次探测] 还没起来，等待 3 秒..."
+  sleep 3
+done
+```
+
+实际输出：
+
+```
+等待 MySQL 就绪...
+[第 1 次探测] 还没起来，等待 3 秒...
+[第 2 次探测] 还没起来，等待 3 秒...
+[第 3 次探测] mysqld is alive —— 就绪
+
+mysqladmin  Ver 8.0.46 for Linux on x86_64 (MySQL Community Server - GPL)
+```
+
+### 步骤 4 进入 MySQL，创建数据库和数据表
+
+建库建表脚本 `db/init.sql`：
+
+```sql
+CREATE DATABASE IF NOT EXISTS ai_quality
+  DEFAULT CHARACTER SET utf8mb4 DEFAULT COLLATE utf8mb4_unicode_ci;
+USE ai_quality;
+
+CREATE TABLE IF NOT EXISTS inspect_records (
+  id          INT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '主键，自增',
+  filename    VARCHAR(255) NOT NULL               COMMENT '上传的图片文件名',
+  result      VARCHAR(16)  NOT NULL               COMMENT '质检结果：缺陷 / 正常',
+  confidence  DECIMAL(5,4) NOT NULL               COMMENT '置信度，0.0000 ~ 1.0000',
+  defect_type VARCHAR(64)  DEFAULT NULL           COMMENT '缺陷类型，正常时为 normal',
+  image_url   VARCHAR(512) DEFAULT NULL           COMMENT '图片访问地址（/static/xxx.jpg）',
+  created_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '质检时间',
+  PRIMARY KEY (id),
+  KEY idx_created_at (created_at),
+  KEY idx_result (result)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 应用专用账号，只授权 ai_quality 库（最小权限原则）
+CREATE USER IF NOT EXISTS 'aiuser'@'%' IDENTIFIED BY 'aiuser123';
+GRANT ALL PRIVILEGES ON ai_quality.* TO 'aiuser'@'%';
+FLUSH PRIVILEGES;
+```
+
+执行并验证：
+
+```bash
+sudo docker exec -i mysql-ai mysql -uroot -p123456 \
+  --default-character-set=utf8mb4 < db/init.sql
+```
+
+实际输出（节选）：
+
+```
+Database
+ai_quality
+...
+Tables_in_ai_quality
+inspect_records
+Field    Type             Null  Key  Default            Extra
+id       int unsigned     NO    PRI  NULL               auto_increment
+filename varchar(255)     NO         NULL
+result   varchar(16)      NO    MUL  NULL
+confidence decimal(5,4)   NO         NULL
+defect_type varchar(64)   YES        NULL
+image_url  varchar(512)   YES        NULL
+created_at datetime       NO    MUL  CURRENT_TIMESTAMP  DEFAULT_GENERATED
+msg
+数据库初始化完成
+```
+
+验证时区与应用账号：
+
+```bash
+sudo docker exec mysql-ai mysql -uroot -p123456 -e \
+  "SELECT @@global.time_zone AS tz, @@system_time_zone AS sys_tz, NOW() AS now_bj;"
+# tz=+08:00   sys_tz=CST   now_bj=2026-10-13 08:44:17
+
+sudo docker exec mysql-ai mysql -uaiuser -paiuser123 -h127.0.0.1 ai_quality -e \
+  "SELECT CURRENT_USER() AS whoami, COUNT(*) AS rows_now FROM inspect_records;"
+# whoami=aiuser@%   rows_now=0
+```
+
+---
+
+## 阶段 3：编写 FastAPI 后端代码
+
+### 步骤 1 创建 main.py
+
+`backend/main.py` 分五层组织：配置区 → 数据库层 → 质检推理引擎 → 工具函数 → 接口层。
+核心接口：
+
+- `GET /health` —— 健康检查，顺带探测数据库连通性
+- `POST /upload` —— 接收图片 → 推理 → 落盘 → 写库 → 返回 JSON
+- `GET /records` —— 查询质检历史，支持分页与结果过滤
+- `/static/**` —— 通过 `StaticFiles` 挂载上传目录
+- `GET /` —— 内嵌一个网页版质检控制台，方便浏览器演示
+
+质检推理引擎（模拟 AI 模型）核心逻辑：
+
+```python
+g = np.asarray(img.convert("L"), dtype=np.float32) / 255.0
+
+dark_ratio   = float(np.mean(g < 0.24))          # 过暗面积占比
+bright_ratio = float(np.mean(g > 0.96))          # 过曝面积占比
+# 3x3 均值滤波与原图做差 -> 局部突变点 = 划痕 / 杂质
+anomaly_ratio = float(np.mean(np.abs(g - local_mean) > 0.25))
+contrast     = float(g.std())                    # 对比度
+
+score = 0.90*min(1, dark_ratio*1.2) + 0.55*min(1, bright_ratio*1.5) \
+      + 0.85*min(1, anomaly_ratio/0.005) + 0.70*blur_score
+p_defect = 1 / (1 + np.exp(-8.0 * (score - 0.5)))
+```
+
+几个工程细节：
+
+1. **先缩放再推理**：图片最长边超过 1024 会先缩放。否则一张 4000×3000 的图做
+   3×3 滤波要构造 9 个 1200 万浮点数组，内存直接爆掉（约 430MB）。
+2. **文件名安全处理**：`os.path.basename` + 正则过滤，防止 `../../etc/passwd`
+   这类路径穿越攻击。
+3. **同名文件自动加序号**：首张图片保留原始文件名，保证 `/static/defect01.jpg`
+   这种验收地址能直接访问。
+4. **启动时等待数据库**：容器启动顺序不确定，MySQL 可能比应用晚就绪，因此
+   `wait_for_db()` 会重试 30 次（每次间隔 2 秒）并顺带建表。
+5. **时间显式写入**：用 `datetime.timezone(timedelta(hours=8))` 直接算北京时间，
+   不依赖容器 tzdata。
+
+### 步骤 2 创建 requirements.txt
+
+```
+fastapi==0.115.6
+uvicorn==0.34.0
+python-multipart==0.0.20
+PyMySQL==1.1.1
+cryptography==44.0.0
+pillow==11.1.0
+numpy==2.2.1
+```
+
+> `cryptography` 是为了支持 MySQL 8 默认的 `caching_sha2_password` 认证插件。
+> 非 SSL 连接下 PyMySQL 需要它来做 RSA 公钥加密，缺了会报认证错误。
+
+### 步骤 3 创建 Dockerfile
+
+```dockerfile
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    TZ=Asia/Shanghai
+
+WORKDIR /app
+
+# 先拷依赖清单再装依赖 —— 利用镜像层缓存，改代码时不必重装依赖
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt \
+        -i https://mirrors.aliyun.com/pypi/simple/ \
+        --trusted-host mirrors.aliyun.com
+
+COPY main.py .
+RUN mkdir -p /app/upload_img
+
+EXPOSE 8000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+**分层缓存的效果**：依赖清单和业务代码分开 `COPY`。第一次构建耗时 1 分 15 秒；
+后续只改 `main.py` 时，pip 安装那一层直接命中缓存，重新构建只要 **0.3 秒**。
+
+### 步骤 4 构建镜像 + 启动 fastapi 容器
+
+```bash
+cd backend
+sudo docker build -t fastapi-ai:v1 .
+```
+
+构建输出（节选）：
+
+```
+#8 [3/6] RUN pip install --no-cache-dir -r requirements.txt ...
+#8 Successfully installed PyMySQL-1.1.1 annotated-types-0.8.0 anyio-4.15.1
+   cffi-2.1.1 click-8.5.0 cryptography-44.0.0 fastapi-0.115.6 h11-0.16.0
+   idna-3.20 numpy-2.2.1 pillow-11.1.0 pycparser-3.11 pydantic-2.14.1
+   pydantic-core-2.50.1 python-multipart-0.0.20 starlette-0.41.3
+   typing-extensions-4.16.0 typing-inspection-0.4.4 uvicorn-0.34.0
+#8 DONE 68.1s
+#11 naming to docker.io/library/fastapi-ai:v1 done
+real  1m15.725s
+```
+
+启动容器 —— **注意这里没有 `-p` 参数**：
+
+```bash
+sudo docker run -d --name fastapi-ai \
+  --network ai-net \
+  -v /home/chen/ai-inspect/upload_img:/app/upload_img \
+  -e DB_HOST=mysql-ai \
+  -e DB_PORT=3306 \
+  -e DB_USER=aiuser \
+  -e DB_PASSWORD=aiuser123 \
+  -e DB_NAME=ai_quality \
+  fastapi-ai:v1
+```
+
+启动日志：
+
+```
+2026-10-13 08:46:48,157 [INFO] 数据库初始化：成功
+2026-10-13 08:46:48,157 [INFO] 上传目录：/app/upload_img
+INFO:     Started server process [1]
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press Ctrl+C to quit)
+```
+
+容器状态印证了端口未对外暴露 —— `PORTS` 列只显示 `8000/tcp`，
+没有 `0.0.0.0:xxxx->8000/tcp` 的映射：
+
+```
+NAMES        STATUS          PORTS
+fastapi-ai   Up 12 seconds   8000/tcp
+mysql-ai     Up 2 minutes    0.0.0.0:3306->3306/tcp, [::]:3306/tcp
+```
+
+容器内自测接口：
+
+```bash
+sudo docker exec fastapi-ai python -c "
+import urllib.request, json
+for p in ['/health','/records']:
+    with urllib.request.urlopen('http://127.0.0.1:8000'+p) as r:
+        print(p, '->', r.status, r.read().decode())
+"
+# /health -> 200 {"status": "ok", "service": "fastapi-ai", "db": "connected", ...}
+# /records -> 200 {"code": 0, "total": 0, "defect": 0, "normal": 0, "data": []}
+```
+
+---
+
+## 阶段 4：生成测试图片
+
+虚拟机上只有 `python3-pil` 没有 numpy，所以生成脚本写成**纯 PIL 实现**，
+不引入额外依赖：
+
+```bash
+cd /home/chen/ai-inspect
+python3 tools/gen_test_images.py
+```
+
+实际输出：
+
+```
+输出目录：/home/chen/ai-inspect/testdata
+  生成 normal01.jpg   800x600  254.8 KB  <- make_normal
+  生成 normal02.jpg   800x600  254.7 KB  <- make_normal
+  生成 defect01.jpg   800x600  8.0 KB    <- make_black
+  生成 defect02.jpg   800x600  290.1 KB  <- make_scratch
+  生成 defect03.jpg   800x600  119.1 KB  <- make_overexposed
+  生成 defect04.jpg   800x600  93.7 KB   <- make_blurry
+完成，共 6 张测试图片。
+```
+
+| 文件 | 模拟场景 | 生成方式 |
+|------|----------|----------|
+| `normal01/02.jpg` | 正常产品 | 高斯噪声 + 拉丝纹理模拟金属表面 |
+| `defect01.jpg` | 镜头遮挡 / 严重污损 | 全黑图（8KB，验收项要求） |
+| `defect02.jpg` | 表面划痕、杂质 | 正常表面 + 若干深色划痕线 |
+| `defect03.jpg` | 强反光过曝 | 亮度 252 + 微小噪声 |
+| `defect04.jpg` | 失焦模糊 | 亮度 180 + 极小噪声（低对比） |
+
+**离线自检**：部署前先在本地跑一遍模型，避免反复往返试错：
+
+```bash
+python3 tools/self_check.py
+```
+
+```
+文件             判定     置信度      缺陷分      期望/结果
+------------------------------------------------------------------------
+normal01.jpg   正常     0.9809   0.0076     正常 -> 正常  [OK ]  无异常
+normal02.jpg   正常     0.9803   0.0117     正常 -> 正常  [OK ]  无异常
+defect01.jpg   缺陷     0.9820   1.0000     缺陷 -> 缺陷  [OK ]  亮度异常(过暗/污损)
+defect02.jpg   缺陷     0.9264   0.8167     缺陷 -> 缺陷  [OK ]  表面划痕/杂质
+defect03.jpg   缺陷     0.9820   1.0000     缺陷 -> 缺陷  [OK ]  过曝/反光
+defect04.jpg   缺陷     0.6264   0.5646     缺陷 -> 缺陷  [OK ]  成像模糊/低对比
+------------------------------------------------------------------------
+全部通过
+```
+
+---
+
+## 阶段 5：Nginx 反向代理配置
+
+### 步骤 1 编写 nginx.conf
+
+```nginx
+worker_processes auto;
+events { worker_connections 1024; }
+
+http {
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
+    access_log    /var/log/nginx/access.log main;
+    sendfile      on;
+    gzip          on;
+    gzip_types    text/plain text/css application/json application/javascript;
+
+    # Docker 内置 DNS，配合变量实现「运行时动态解析」
+    resolver 127.0.0.11 valid=10s ipv6=off;
+
+    server {
+        listen 80;
+        server_name _;
+
+        # 上传图片，默认上限 1M 会 413，必须放开
+        client_max_body_size 20m;
+
+        # 同一网络里容器名就是域名，绝不能写 127.0.0.1
+        set $backend "http://fastapi-ai:8000";
+
+        # 静态原图：Nginx 直接读共享卷返回，不消耗后端资源
+        location /static/ {
+            alias      /usr/share/nginx/html/static/;
+            expires    1h;
+            add_header Cache-Control "public";
+            try_files  $uri =404;
+        }
+
+        # 带 /api 前缀的请求：剥掉前缀再转发
+        location /api/ {
+            rewrite ^/api/(.*)$ /$1 break;
+            proxy_pass         $backend;
+            proxy_http_version 1.1;
+            proxy_set_header   Host              $host;
+            proxy_set_header   X-Real-IP         $remote_addr;
+            proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+            proxy_set_header   Connection        "";
+        }
+
+        # 其余请求原样转发：/health /records /upload / /docs
+        location / {
+            proxy_pass         $backend;
+            proxy_http_version 1.1;
+            proxy_set_header   Host              $host;
+            proxy_set_header   X-Real-IP         $remote_addr;
+            proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+            proxy_set_header   Connection        "";
+        }
+
+        # Nginx 自身健康检查
+        location = /nginx-health {
+            access_log off;
+            return 200 "nginx ok\n";
+        }
+    }
+}
+```
+
+### 步骤 2 启动前先做语法校验
+
+```bash
+sudo docker run --rm --network ai-net \
+  -v /home/chen/ai-inspect/nginx/nginx.conf:/etc/nginx/nginx.conf:ro \
+  nginx:latest nginx -t
+```
+
+```
+nginx: the configuration file /etc/nginx/nginx.conf syntax is ok
+nginx: configuration file /etc/nginx/nginx.conf test is successful
+```
+
+> 注意要加 `--network ai-net`：配置里引用了容器名 `fastapi-ai`，不在同一个
+> 网络里会解析失败，`nginx -t` 直接报 `host not found in upstream`。
+
+### 步骤 3 启动 nginx 容器
+
+```bash
+sudo docker run -d --name nginx-ai \
+  --network ai-net \
+  -p 80:80 \
+  -v /home/chen/ai-inspect/nginx/nginx.conf:/etc/nginx/nginx.conf:ro \
+  -v /home/chen/ai-inspect/upload_img:/usr/share/nginx/html/static:ro \
+  nginx:latest
+```
+
+```
+NAMES        IMAGE           STATUS          PORTS
+nginx-ai     nginx:latest    Up 4 seconds    0.0.0.0:80->80/tcp, [::]:80->80/tcp
+fastapi-ai   fastapi-ai:v1   Up 46 seconds   8000/tcp
+mysql-ai     mysql:8.0       Up 4 minutes    0.0.0.0:3306->3306/tcp
+
+$ sudo docker network inspect ai-net --format '...'
+nginx-ai    -> 172.18.0.4/16
+mysql-ai    -> 172.18.0.2/16
+fastapi-ai  -> 172.18.0.3/16
+```
+
+---
+
+## 阶段 6：项目验收
+
+### 验收 1 —— `GET /health` 返回 ok
+
+```bash
+curl http://192.168.88.130/health
+```
+
+```json
+{"status":"ok","service":"fastapi-ai","db":"connected","time":"2026-10-13 08:49:23"}
+```
+
+补充验证反向代理与端口隐藏：
+
+```
+$ curl http://192.168.88.130/nginx-health
+nginx ok
+
+$ curl http://192.168.88.130/api/health        # 前缀重写生效
+{"status":"ok","service":"fastapi-ai","db":"connected",...}
+
+$ curl --max-time 5 http://192.168.88.130:8000/health
+curl: (7) Failed to connect to 192.168.88.130 port 8000 after 0 ms: Couldn't connect
+```
+
+最后一条正是期望结果：**8000 端口对外不可达**，后端被 Nginx 完全隐藏。
+
+### 验收 2 —— 上传图片返回缺陷 / 正常 JSON
+
+```bash
+curl -X POST -F "file=@testdata/defect01.jpg" http://192.168.88.130/upload
+curl -X POST -F "file=@testdata/normal01.jpg" http://192.168.88.130/upload
+```
+
+**正常样本**：
+
+```json
+{
+  "code": 0, "msg": "质检完成",
+  "data": {
+    "id": 1, "filename": "normal01.jpg",
+    "result": "正常", "confidence": 0.9809,
+    "defect_type": "normal", "defect_type_cn": "无异常",
+    "defect_score": 0.0076,
+    "features": { "dark_ratio": 0.0, "bright_ratio": 0.0002,
+                  "anomaly_ratio": 0.0, "contrast": 0.0518,
+                  "blur_score": 0.0, "image_size": "800x600",
+                  "f3_scratch": 0.0087 },
+    "image_url": "/static/normal01.jpg",
+    "infer_cost_ms": 17
+  }
+}
+```
+
+**缺陷样本**：
+
+```json
+{
+  "code": 0, "msg": "质检完成",
+  "data": {
+    "id": 2, "filename": "defect01.jpg",
+    "result": "缺陷", "confidence": 0.982,
+    "defect_type": "亮度异常(过暗/污损)",
+    "defect_score": 1.0,
+    "features": { "dark_ratio": 1.0, "bright_ratio": 0.0,
+                  "anomaly_ratio": 0.0, "contrast": 0.0,
+                  "blur_score": 1.0, "image_size": "800x600",
+                  "f3_scratch": 0.0 },
+    "image_url": "/static/defect01.jpg",
+    "infer_cost_ms": 19
+  }
+}
+```
+
+6 张图片的完整判定结果：
+
+| ID | 文件名 | 判定 | 置信度 | 缺陷分 | 缺陷类型 |
+|----|--------|------|--------|--------|----------|
+| 1 | normal01.jpg | 正常 | 0.9809 | 0.0076 | 无异常 |
+| 2 | defect01.jpg | **缺陷** | 0.9820 | 1.0000 | 亮度异常(过暗/污损) |
+| 3 | normal02.jpg | 正常 | 0.9803 | 0.0117 | 无异常 |
+| 4 | defect02.jpg | **缺陷** | 0.9264 | 0.8167 | 表面划痕/杂质 |
+| 5 | defect03.jpg | **缺陷** | 0.9820 | 1.0000 | 过曝/反光 |
+| 6 | defect04.jpg | **缺陷** | 0.6264 | 0.5646 | 成像模糊/低对比 |
+
+单张推理耗时 9 ~ 80 毫秒（800×600 图片，纯 CPU）。
+
+### 验收 3 —— `/records` 查到质检记录
+
+```bash
+curl http://192.168.88.130/records
+```
+
+```json
+{
+  "code": 0, "msg": "ok",
+  "total": 6, "defect": 4, "normal": 2, "count": 6,
+  "data": [
+    { "id": 6, "filename": "defect04.jpg", "result": "缺陷",
+      "confidence": 0.6264, "defect_type": "成像模糊/低对比",
+      "image_url": "/static/defect04.jpg", "created_at": "2026-10-13 08:53:55" },
+    { "id": 5, "filename": "defect03.jpg", "result": "缺陷",
+      "confidence": 0.982, "defect_type": "过曝/反光",
+      "image_url": "/static/defect03.jpg", "created_at": "2026-10-13 08:53:55" },
+    ... 共 6 条 ...
+  ]
+}
+```
+
+时间戳 `08:53:55` 已是北京时间，说明时区配置生效。
+
+### 验收 4 —— 浏览器访问原图
+
+```bash
+curl -I http://192.168.88.130/static/defect01.jpg
+```
+
+```
+HTTP/1.1 200 OK
+Server: nginx
+Content-Type: image/jpeg
+Content-Length: 8227
+Last-Modified: Tue, 13 Oct 2026 00:53:54 GMT
+ETag: "6acd8122-2023"
+```
+
+响应头里的 `ETag` / `Last-Modified` 来自 Nginx 静态文件模块，**说明图片是 Nginx
+直接读共享卷返回的，没有经过 FastAPI 转发**。
+
+三张图片实测：
+
+```
+/static/defect01.jpg  HTTP 200  image/jpeg  8227 bytes
+/static/normal01.jpg  HTTP 200  image/jpeg  260948 bytes
+/static/defect02.jpg  HTTP 200  image/jpeg  297037 bytes
+```
+
+浏览器可直接访问的地址：
+
+- 质检控制台：`http://192.168.88.130/`
+- 缺陷原图：`http://192.168.88.130/static/defect01.jpg`
+- 接口文档：`http://192.168.88.130/docs`
+
+### 验收 5 —— 三个容器全部运行在 ai-net 网络
+
+```bash
+sudo docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}'
+sudo docker network inspect ai-net --format '{{range .Containers}}{{.Name}} -> {{.IPv4Address}}{{"\n"}}{{end}}'
+```
+
+```
+NAMES        IMAGE           STATUS       PORTS
+nginx-ai     nginx:latest    Up ...       0.0.0.0:80->80/tcp
+fastapi-ai   fastapi-ai:v1   Up ...       8000/tcp
+mysql-ai     mysql:8.0       Up ...       0.0.0.0:3306->3306/tcp
+
+mysql-ai    -> 172.18.0.2/16
+fastapi-ai  -> 172.18.0.3/16
+nginx-ai    -> 172.18.0.4/16
+```
+
+✅ 五项验收全部通过。
+
+---
+
+## 阶段 7：Git 提交代码
+
+```bash
+cd /home/chen/ai-inspect
+git add .
+git commit -m "feat: AI 视觉质检系统 —— Docker + FastAPI + MySQL + Nginx 全链路打通"
+git log --oneline
+git status
+```
+
+---
+
+## 附录 A：报错与排错记录
+
+### 问题 1：Nginx 配置完成，上传接口却返回空响应 / 500
+
+**现象**：`curl -X POST -F "file=@normal01.jpg" http://IP/upload` 返回空，
+加 `-i` 看到 `HTTP/1.1 500 Internal Server Error`，响应体只有 21 字节。
+
+**排查过程**：
+
+1. 先确认不是 Nginx 的问题 —— 查看 Nginx access log，请求确实转发到了后端：
+
+   ```
+   192.168.88.130 - - "POST /upload HTTP/1.1" 500 21 "-" "curl/8.18.0" rt=0.073
+   ```
+
+2. 再查后端容器日志，拿到完整堆栈：
+
+   ```
+   File "/app/main.py", line 243, in run_inference
+       c_blur = W_BLUR * blur_score
+   NameError: name 'blur_score' is not defined
+   ```
+
+**原因**：`blur_score` 定义在 `extract_features()` 函数内部，却在 `run_inference()`
+里直接引用，作用域不对。
+
+**解决**：在 `extract_features()` 的返回值里加上 `blur_score` 字段，调用处改为
+`feats["blur_score"]`。
+
+**经验教训**：这类错误在容器里才暴露，成本很高。应该在部署前写离线自检脚本
+（`tools/self_check.py`）直接调用推理函数跑一遍全部样本 —— 本次修复后补上了这个
+脚本，之后每次改模型都先本地自检再部署，一次通过。
+
+### 问题 2：`sudo docker exec` 报 "A terminal is required to authenticate"
+
+**现象**：
+
+```
+sudo: A terminal is required to authenticate
+sudo: interactive authentication is required
+```
+
+**原因**：通过 SSH 以非交互方式执行命令时，`sudo` 默认没有 tty，无法弹出密码提示。
+
+**解决**：改用 `sudo -S`（从标准输入读取密码）：
+
+```bash
+echo '123456' | sudo -S -p '' bash -lc '<命令>'
+```
+
+或者在 SSH 会话里分配伪终端（`ssh -t`）。
+
+### 问题 3：MySQL 容器刚启动就连接失败
+
+**现象**：`docker run` 后立刻执行 `mysqladmin ping` 报错，日志显示 MySQL 还在
+初始化数据目录。
+
+**原因**：MySQL 首次启动需要执行 `mysqld --initialize`，耗时十几秒到几十秒；
+而 `docker run -d` 是异步返回的，容器状态为 `Up` 并不代表数据库可用。
+
+**解决**：用循环轮询 `mysqladmin ping` 直到返回 `mysqld is alive`（见阶段 2 步骤 3），
+而不是简单地 `sleep` 固定秒数。
+
+### 问题 4：`created_at` 比实际时间少 8 小时
+
+**现象**：明明北京时间 08:53，查出来却是 `00:53`。
+
+**原因**：容器基础镜像的默认时区是 **UTC**，MySQL 的 `CURRENT_TIMESTAMP`
+取的也是容器的系统时间。
+
+**解决**：双重保障 ——
+
+1. MySQL 容器启动时加 `-e TZ=Asia/Shanghai` 与服务器参数 `--default-time-zone=+08:00`
+2. 应用侧用 `datetime.timezone(timedelta(hours=8))` 显式计算北京时间后显式写入，
+   不依赖容器 tzdata（`python:3.11-slim` 里没有时区数据库）
+
+### 问题 5：Nginx 反向代理的"IP 漂移"陷阱（重点）
+
+**现象**：最初配置写成
+
+```nginx
+upstream fastapi_backend {
+    server fastapi-ai:8000;
+}
+```
+
+接口正常。但只要 `docker rm` 掉后端容器再重新创建，页面立刻变成 **502 Bad Gateway**。
+
+**原因**：Nginx 对静态 `upstream` 里的域名，**只在启动那一刻解析一次**，之后
+永久使用缓存的 IP。后端容器重建后 IP 变了，Nginx 还在往旧 IP 发请求。
+
+**验证实验**：故意让后端换 IP，再确认问题与修复效果：
+
+```
+改造前：nginx-ai=172.18.0.4  mysql-ai=172.18.0.2  fastapi-ai=172.18.0.3
+
+>>> 第1步：删掉 fastapi-ai，用一个占位容器抢走它原来的 IP
+   占位后：ip-blocker=172.18.0.3  nginx-ai=172.18.0.4  mysql-ai=172.18.0.2
+
+>>> 第2步：重新启动 fastapi-ai（此时只能拿到「新」IP）
+   重启后：ip-blocker=172.18.0.3  nginx-ai=172.18.0.4
+           mysql-ai=172.18.0.2    fastapi-ai=172.18.0.5   ← IP 变了！
+
+>>> 第3步：Nginx 全程没有重启，直接访问接口
+   /health        HTTP 200
+   /records       HTTP 200
+   /upload        HTTP 200
+```
+
+**解决**：改用「运行时动态解析」—— 用 `resolver` 指向 Docker 内置 DNS，
+并在 `proxy_pass` 里使用变量，Nginx 就会按 `valid=10s` 的周期重新解析容器名：
+
+```nginx
+resolver 127.0.0.11 valid=10s ipv6=off;
+server {
+    set $backend "http://fastapi-ai:8000";
+    location / {
+        proxy_pass $backend;      # 用变量 -> 每次请求重新解析
+    }
+}
+```
+
+**对比总结**：
+
+| 写法 | Nginx 重启后 | 后端容器重建后 |
+|------|--------------|----------------|
+| `upstream { server fastapi-ai:8000; }` | 正常 | ❌ 502（用的还是旧 IP） |
+| `resolver` + 变量 `proxy_pass` | 正常 | ✅ 自动跟进新 IP |
+
+### 问题 6：上传大图返回 413 Request Entity Too Large
+
+**原因**：Nginx 默认 `client_max_body_size` 只有 **1M**，而工业相机拍的图
+往往好几 MB。
+
+**解决**：在 `server` 块里显式放开：`client_max_body_size 20m;`
+
+### 问题 7：Windows 端脚本传文件时远程路径被改写
+
+**现象**：用 SFTP 上传时，远程路径 `/home/chen/...` 被自动转换成了
+`C:/Users/.../PortableGit/home/chen/...`。
+
+**原因**：Git Bash（MSYS2）会把看起来像 Unix 绝对路径的命令行参数自动转换成
+Windows 路径。
+
+**解决**：执行时加上环境变量禁用转换：
+
+```bash
+MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' python rc.py put <本地> <远程>
+```
+
+### 优化点：镜像构建慢
+
+**问题**：`COPY . .` 之后再 `RUN pip install`，每次改一行代码都要重新装一遍依赖。
+
+**解决**：把依赖清单和业务代码分开 `COPY`，并让 `requirements.txt` 先于 `main.py`
+拷贝，充分利用 Docker 的构建缓存：
+
+```
+COPY requirements.txt .     # 这一层只有依赖变化时才失效
+RUN  pip install ...
+COPY main.py .              # 改代码只影响这一层
+```
+
+效果：首次构建 1 分 15 秒 → 后续改代码重建 **0.3 秒**。
+
+---
+
+## 附录 B：常用运维命令
+
+```bash
+# 查看三个容器状态
+sudo docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
+
+# 查看网络内的容器与 IP
+sudo docker network inspect ai-net \
+  --format '{{range .Containers}}{{.Name}} -> {{.IPv4Address}}{{"\n"}}{{end}}'
+
+# 实时看后端日志（排查 500 用）
+sudo docker logs -f fastapi-ai
+
+# 实时看 Nginx 访问日志
+sudo docker logs -f nginx-ai
+
+# 进 MySQL 交互式命令行
+sudo docker exec -it mysql-ai mysql -uroot -p123456 ai_quality
+
+# 重新加载 Nginx 配置（不中断服务）
+sudo docker exec nginx-ai nginx -s reload
+
+# 改完代码重新部署后端
+cd backend && sudo docker build -t fastapi-ai:v1 . \
+  && sudo docker rm -f fastapi-ai \
+  && sudo docker run -d --name fastapi-ai --network ai-net \
+       -v /home/chen/ai-inspect/upload_img:/app/upload_img \
+       -e DB_HOST=mysql-ai -e DB_USER=aiuser -e DB_PASSWORD=aiuser123 \
+       -e DB_NAME=ai_quality fastapi-ai:v1
+
+# 说明：得益于 Nginx 的动态解析，重建后端容器后无需重启 nginx-ai
+```
+
+### 数据库常用 SQL
+
+```sql
+-- 查看最近 10 条质检记录
+SELECT id, filename, result, confidence, defect_type, created_at
+FROM inspect_records ORDER BY id DESC LIMIT 10;
+
+-- 统计缺陷率
+SELECT result, COUNT(*) AS cnt,
+       CONCAT(ROUND(COUNT(*) * 100.0 / (SELECT COUNT(*) FROM inspect_records), 2), '%') AS pct
+FROM inspect_records GROUP BY result;
+
+-- 查询置信度偏低、需要人工复检的记录
+SELECT * FROM inspect_records WHERE confidence < 0.8 ORDER BY confidence;
+```
+
+---
+
+## 附录 C：数据持久化验证
+
+`mysql-data/` 目录挂载的意义 —— 容器删除后数据不丢：
+
+```bash
+# 1. 记录当前数据量
+sudo docker exec mysql-ai mysql -uroot -p123456 ai_quality \
+  -e "SELECT COUNT(*) FROM inspect_records;"      # 6
+
+# 2. 删除并重建容器
+sudo docker rm -f mysql-ai
+sudo docker run -d --name mysql-ai --network ai-net \
+  -e MYSQL_ROOT_PASSWORD=123456 -e TZ=Asia/Shanghai -p 3306:3306 \
+  -v /home/chen/ai-inspect/mysql-data:/var/lib/mysql mysql:8.0 \
+  --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci \
+  --default-time-zone=+08:00
+
+# 3. 等待就绪后再查，数据仍在
+sudo docker exec mysql-ai mysql -uroot -p123456 ai_quality \
+  -e "SELECT COUNT(*) FROM inspect_records;"      # 依然是 6
+```

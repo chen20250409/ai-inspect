@@ -1,0 +1,8 @@
+mysql-data/
+upload_img/*
+!upload_img/.gitkeep
+__pycache__/
+*.py[cod]
+.venv/
+*.log
+.DS_Store
