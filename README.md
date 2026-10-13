@@ -43,7 +43,9 @@ ai-inspect/
 │   └── nginx.conf           # 反向代理配置
 ├── tools/
 │   ├── gen_test_images.py   # 生成 6 张测试图片（纯 PIL）
-│   └── self_check.py        # 离线自检：验证 6 张图的判定结果
+│   ├── self_check.py        # 离线自检：验证 6 张图的判定结果
+│   └── capture_screenshots.py  # SSH 隧道 + 无头浏览器自动截图
+├── screenshots/             # 功能验收截图
 ├── testdata/                # 测试图片
 ├── upload_img/              # 上传图片持久化目录（挂载到容器）
 ├── mysql-data/              # MySQL 数据持久化目录（挂载到容器）
